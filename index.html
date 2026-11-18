@@ -614,6 +614,7 @@
         <div class="flex items-center justify-between pt-1 border-t border-white/5">
           <span id="savedPositionIndicator" class="text-[10px] font-mono opacity-85 truncate max-w-[160px]">📍 الموضع: البداية</span>
           <div class="flex items-center gap-2">
+            <span id="appBuildVersion" class="text-[10px] font-mono opacity-60" dir="ltr">v4</span>
             <button id="btnResetDemo" class="hover:underline text-[11px]" style="color: var(--tg-accent);">
               الشات التجريبي
             </button>
@@ -1410,22 +1411,29 @@
       if (!mediaEntries || mediaEntries.length === 0) return true;
       const db = await openViewerDB();
       if (!db) return false;
-      return new Promise((resolve) => {
-        try {
-          const tx = db.transaction('media', 'readwrite');
-          const store = tx.objectStore('media');
-          // Limit persisted media blobs to 300 files so huge folders never choke IndexedDB
-          const slice = mediaEntries.slice(0, 300);
-          for (const item of slice) {
-            store.put({ path: item.path, blob: item.blob }, item.path);
+      const CHUNK = 20;
+      for (let i = 0; i < mediaEntries.length; i += CHUNK) {
+        const slice = mediaEntries.slice(i, i + CHUNK);
+        const ok = await new Promise((resolve) => {
+          try {
+            const tx = db.transaction('media', 'readwrite');
+            const store = tx.objectStore('media');
+            for (const item of slice) {
+              store.put({ path: item.path, blob: item.blob }, item.path);
+            }
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = () => resolve(false);
+            tx.onabort = () => resolve(false);
+          } catch (e) {
+            resolve(false);
           }
-          tx.oncomplete = () => resolve(true);
-          tx.onerror = () => resolve(false);
-          tx.onabort = () => resolve(false);
-        } catch (e) {
-          resolve(false);
+        });
+        if (!ok) {
+          showToast('مساحة المتصفح مليت — اتحفظ جزء من الوسائط بس');
+          return false;
         }
-      });
+      }
+      return true;
     }
 
     async function idbGet(storeName, key) {
@@ -1743,22 +1751,88 @@
       return null;
     }
 
-    function registerBlobFileInMemory(relativePath, blob) {
-      const url = URL.createObjectURL(blob);
+    // Every lookup key a relative media path can be addressed by (full path, without root folder, last 2 segments, filename).
+    function mediaPathKeys(relativePath) {
       const norm = normalizePath(relativePath);
       const parts = norm.split('/').filter(Boolean);
-      state.localFileBlobs.set(norm, url);
-      if (parts.length > 1) {
-        state.localFileBlobs.set(parts.slice(1).join('/'), url);
-      }
-      if (parts.length >= 2) {
-        state.localFileBlobs.set(parts.slice(-2).join('/'), url);
-      }
-      if (parts.length > 0) {
-        state.localFileBlobs.set(parts[parts.length - 1], url);
-      }
-      return norm;
+      const keys = [norm];
+      if (parts.length > 1) keys.push(parts.slice(1).join('/'));
+      if (parts.length >= 2) keys.push(parts.slice(-2).join('/'));
+      if (parts.length > 0) keys.push(parts[parts.length - 1]);
+      return keys;
     }
+
+    function registerBlobFileInMemory(relativePath, blob) {
+      const typed = blob.type ? blob : new Blob([blob], { type: guessMimeType(relativePath) });
+      const url = URL.createObjectURL(typed);
+      mediaPathKeys(relativePath).forEach(key => state.localFileBlobs.set(key, url));
+      return normalizePath(relativePath);
+    }
+
+    // Media that lives inside the imported ZIP but was not extracted up front.
+    // Tapping the message extracts just that file, then it is saved to IndexedDB.
+    function registerLazyMediaFile(relativePath, getBlob) {
+      mediaPathKeys(relativePath).forEach(key => {
+        if (!state.localFileBlobs.has(key)) state.lazyZipMediaGetters.set(key, getBlob);
+      });
+    }
+
+    function resolveLazyMediaGetter(relativePath) {
+      if (!relativePath) return null;
+      const keys = mediaPathKeys(relativePath);
+      for (let i = 0; i < keys.length; i++) {
+        const getter = state.lazyZipMediaGetters.get(keys[i]);
+        if (getter) return getter;
+      }
+      return null;
+    }
+
+    function mediaMarkupForLoadedFile(url, relativePath, msg) {
+      const fileName = String(relativePath || '').split('/').pop();
+      if (msg.photo && !msg.file) {
+        return `<div class="mb-1.5 -mx-1 -mt-0.5 overflow-hidden rounded-xl cursor-pointer group relative"
+                     onclick="openLightbox('${url}', '${escapeHtml(getPlainText(msg).slice(0, 120))}')">
+                  <img src="${url}" alt="صورة الشات" class="max-h-72 w-full object-cover rounded-xl transition group-hover:scale-[1.01]" />
+                </div>`;
+      }
+      if (msg.media_type === 'voice_message' || msg.media_type === 'audio_file') {
+        return `<div class="my-1.5"><audio controls src="${url}" class="h-9 max-w-[240px]"></audio></div>`;
+      }
+      if (msg.media_type === 'video_file' || /\.(mp4|webm|mov)$/i.test(fileName)) {
+        return `<video controls src="${url}" class="max-h-72 rounded-xl my-1.5 w-full"></video>`;
+      }
+      if (msg.media_type === 'sticker') {
+        return `<img src="${url}" alt="sticker" class="w-36 h-36 object-contain my-1" />`;
+      }
+      return `<a href="${url}" download="${escapeHtml(fileName)}" class="inline-block px-3 py-1.5 rounded-lg bg-sky-500 text-white text-[11px] font-semibold my-1">تحميل ${escapeHtml(fileName)}</a>`;
+    }
+
+    window.loadDeferredMedia = async function(msgId) {
+      const slot = document.getElementById('media-slot-' + msgId);
+      const chat = getActiveChat();
+      const msg = chat && chat.messages.find(m => String(m.id) === String(msgId));
+      if (!msg) return;
+      const relPath = msg.photo || msg.file;
+      const getter = resolveLazyMediaGetter(relPath);
+      if (!getter) {
+        showToast('الملف ده مش موجود في النسخة المستوردة — استورد مجلد التصدير أو الـ ZIP كامل');
+        return;
+      }
+      if (slot) slot.innerHTML = '<div class="my-1.5 px-3 py-2 rounded-xl bg-black/20 text-[11px] opacity-80">جاري فتح الملف من الأرشيف…</div>';
+      try {
+        const raw = await getter();
+        const blob = raw.type ? raw : new Blob([raw], { type: guessMimeType(relPath) });
+        registerBlobFileInMemory(relPath, blob);
+        const url = resolveMediaUrl(relPath);
+        idbSetBatchMedia([{ path: normalizePath(relPath), blob }]);
+        updateLocalMediaCounter();
+        const freshSlot = document.getElementById('media-slot-' + msgId);
+        if (freshSlot) freshSlot.innerHTML = mediaMarkupForLoadedFile(url, relPath, msg);
+        showToast('اتفتح الملف واتحفظ للمرات الجاية');
+      } catch (e) {
+        if (slot) slot.innerHTML = '<div class="my-1.5 px-3 py-2 rounded-xl bg-red-500/15 text-[11px] text-red-300">مش قادر أفتح الملف من الأرشيف</div>';
+      }
+    };
 
     function updateLocalMediaCounter() {
       const uniqueUrls = new Set(state.localFileBlobs.values());
@@ -2474,7 +2548,7 @@
             });
           } else if (isLikelyMediaPath(relPath)) {
             const norm = registerBlobFileInMemory(relPath, f);
-            if (norm && f.size < 10 * 1024 * 1024 && mediaToPersist.length < 200) {
+            if (norm) {
               mediaToPersist.push({ path: norm, blob: f });
             }
           }
@@ -2531,25 +2605,32 @@
                 });
               } else if (isLikelyMediaPath(relPath)) {
                 zipMediaEntries.push({ relPath, uncompressedSize: entry.uncompressedSize || 0, getBlob: entry.getBlob });
+                // Keep a pointer to every media file in the archive so big videos/audio can be
+                // extracted on demand instead of being dropped during import.
+                registerLazyMediaFile(relPath, () => entry.getBlob().then(b => (b && b.type ? b : new Blob([b], { type: guessMimeType(relPath) }))));
               }
             }
 
-            // Extract small media files (< 3MB, up to 120 files) so photos & voice notes show up immediately without exhausting mobile RAM
-            const smallMedia = zipMediaEntries.filter(m => m.uncompressedSize < 3 * 1024 * 1024).slice(0, 120);
-            for (let mIdx = 0; mIdx < smallMedia.length; mIdx++) {
-              const item = smallMedia[mIdx];
+            // Photos and voice notes are small, so everything under 8MB is extracted right away.
+            // Bigger files (long videos) stay in the archive and are extracted on first tap,
+            // which keeps mobile RAM and browser storage from blowing up during import.
+            const EAGER_MEDIA_LIMIT = 8 * 1024 * 1024;
+            const eagerMedia = zipMediaEntries.filter(m => m.uncompressedSize < EAGER_MEDIA_LIMIT);
+            for (let mIdx = 0; mIdx < eagerMedia.length; mIdx++) {
+              const item = eagerMedia[mIdx];
               if (mIdx % 15 === 0) {
                 showImportProgress(
                   `جاري تجهيز الصور والصوتيات من ${zf.name}...`,
-                  `تم تجهيز ${mIdx + 1} من ${smallMedia.length} ملف وسائط`,
-                  25 + Math.round((mIdx / Math.max(1, smallMedia.length)) * 20)
+                  `تم تجهيز ${mIdx + 1} من ${eagerMedia.length} ملف وسائط`,
+                  25 + Math.round((mIdx / Math.max(1, eagerMedia.length)) * 20)
                 );
                 await new Promise(r => setTimeout(r, 0));
               }
               try {
-                const blob = await item.getBlob();
+                const rawBlob = await item.getBlob();
+                const blob = rawBlob.type ? rawBlob : new Blob([rawBlob], { type: guessMimeType(item.relPath) });
                 const norm = registerBlobFileInMemory(item.relPath, blob);
-                if (norm && blob.size < 2 * 1024 * 1024 && mediaToPersist.length < 100) {
+                if (norm) {
                   mediaToPersist.push({ path: norm, blob });
                 }
               } catch (e) {}
@@ -3049,6 +3130,12 @@
       const winStart = state.virtualWindow.active ? state.virtualWindow.start : 0;
       const winEnd = state.virtualWindow.active ? state.virtualWindow.end : total;
 
+      // Media that exists in the imported archive but was not extracted yet gets a one-tap loader.
+      const lazyLoadButton = (path, msgId) => {
+        if (!path || !resolveLazyMediaGetter(path)) return '';
+        return `<button onclick="loadDeferredMedia('${msgId}')" class="px-2.5 py-1 rounded-lg bg-sky-500 text-white text-[11px] font-semibold flex-shrink-0">تحميل</button>`;
+      };
+
       const fragment = document.createDocumentFragment();
 
       // Top Virtual Spacer for unrendered earlier messages
@@ -3174,13 +3261,15 @@
               </div>
             `;
           } else {
+            const canLazyPhoto = Boolean(resolveLazyMediaGetter(msg.photo));
             mediaHtml += `
               <div class="mb-1.5 p-3 rounded-xl bg-black/20 border border-white/10 flex items-center gap-3 text-xs">
                 <div class="w-10 h-10 rounded-lg bg-sky-500/20 text-sky-400 flex items-center justify-center flex-shrink-0">📷</div>
                 <div class="min-w-0 flex-1">
                   <div class="font-semibold truncate">${escapeHtml(msg.photo.split('/').pop())}</div>
-                  <div class="text-[10px] opacity-70">ارفع مجلد الصور أو الـ ZIP لعرض الصورة الأصلية</div>
+                  <div class="text-[10px] opacity-70">${canLazyPhoto ? 'الصورة موجودة في الأرشيف — اضغط تحميل لعرضها' : 'ملفات الصور مش مستوردة — استورد مجلد التصدير أو الـ ZIP كامل'}</div>
                 </div>
+                ${lazyLoadButton(msg.photo, msg.id)}
               </div>
             `;
           }
@@ -3203,6 +3292,7 @@
               const h = 25 + ((Number(msg.id || 1) * 17 + i * 31) % 70);
               return `<span class="voice-bar w-1 rounded-full bg-sky-400/75 transition-all" style="height:${h}%"></span>`;
             }).join('');
+            const hasLazyVoice = Boolean(resolveLazyMediaGetter(msg.file));
             mediaHtml += `
               <div class="my-1.5 flex items-center gap-2.5 min-w-[210px] max-w-[260px] py-1">
                 <button onclick="toggleSimulatedVoice(this, ${dur})"
@@ -3217,7 +3307,9 @@
                     <span>رسالة صوتية</span>
                   </div>
                 </div>
+                ${lazyLoadButton(msg.file, msg.id)}
               </div>
+              ${hasLazyVoice ? '<div class="text-[10px] opacity-70">الصوت موجود في الأرشيف — اضغط تحميل لتشغيله</div>' : '<div class="text-[10px] opacity-70">ملف الصوت مش مستورد — استورد مجلد التصدير أو الـ ZIP كامل</div>'}
             `;
           }
         }
@@ -3225,7 +3317,9 @@
         else if (msg.file && msg.media_type !== 'sticker') {
           const fileUrl = resolveMediaUrl(msg.file);
           const fileName = String(msg.file).split('/').pop();
-          if (fileUrl && (msg.media_type === 'video_file' || /\.(mp4|webm|mov)$/i.test(fileName))) {
+          const isVideoFile = msg.media_type === 'video_file' || /\.(mp4|webm|mov)$/i.test(fileName);
+          const hasLazyFile = Boolean(resolveLazyMediaGetter(msg.file));
+          if (fileUrl && isVideoFile) {
             mediaHtml += `
               <video controls src="${fileUrl}" class="max-h-72 rounded-xl my-1.5 w-full"></video>
             `;
@@ -3234,14 +3328,19 @@
               <div class="my-1.5 p-2.5 rounded-xl bg-black/20 border border-white/10 flex items-center gap-3">
                 <div class="w-10 h-10 rounded-xl flex items-center justify-center text-white font-bold text-xs flex-shrink-0"
                      style="background-color: var(--tg-accent);">
-                  📄
+                  ${isVideoFile ? '🎬' : '📄'}
                 </div>
                 <div class="min-w-0 flex-1">
                   <div class="text-xs font-semibold truncate" dir="ltr">${escapeHtml(fileName)}</div>
                   <div class="text-[10px] opacity-70">${escapeHtml(msg.mime_type || 'ملف مرفق')}</div>
                 </div>
-                ${fileUrl ? `<a href="${fileUrl}" download="${escapeHtml(fileName)}" class="px-2.5 py-1 rounded-lg bg-sky-500 text-white text-[11px] font-semibold">تحميل</a>` : ''}
+                ${fileUrl
+                  ? `<a href="${fileUrl}" download="${escapeHtml(fileName)}" class="px-2.5 py-1 rounded-lg bg-sky-500 text-white text-[11px] font-semibold flex-shrink-0">تحميل</a>`
+                  : lazyLoadButton(msg.file, msg.id)}
               </div>
+              ${fileUrl ? '' : (hasLazyFile
+                ? '<div class="text-[10px] opacity-70">الملف موجود في الأرشيف — اضغط تحميل لفتحه</div>'
+                : '<div class="text-[10px] opacity-70">الملف مش مستورد — استورد مجلد التصدير أو الـ ZIP كامل</div>')}
             `;
           }
         }
@@ -3300,7 +3399,7 @@
             ${senderHeaderHtml}
             ${forwardedHtml}
             ${replyHtml}
-            ${mediaHtml}
+            ${mediaHtml ? `<div id="media-slot-${msg.id}">${mediaHtml}</div>` : ''}
             ${richTextHtml ? `<div dir="auto" class="text-[13.5px] leading-relaxed break-words">${richTextHtml}</div>` : ''}
             ${reactionsHtml}
             <div class="flex items-center justify-end gap-1 mt-1 text-[10px] opacity-70 select-none">
@@ -3329,6 +3428,17 @@
 
     // Dynamic Virtual Scroll Window Shifting on Scroll (keeps 60fps across 50,000+ messages)
     let virtualFlushTimer = null;
+    let virtualShiftDebounceTimer = null;
+
+    // Android keeps firing scroll events after the finger lifts (momentum). Rebuilding the window
+    // on those events is what teleported the reader, so the rebuild waits for the fling to go quiet.
+    function scheduleVirtualShift() {
+      clearTimeout(virtualShiftDebounceTimer);
+      virtualShiftDebounceTimer = setTimeout(() => {
+        virtualShiftDebounceTimer = null;
+        handleVirtualViewportScroll();
+      }, 150);
+    }
 
     function handleVirtualViewportScroll(force = false) {
       if (!state.virtualWindow.active || state.isRestoringScroll || state.isInitializing) return;
@@ -3393,7 +3503,14 @@
         total - 1,
         Math.max(0, Math.round(centerIdxFloat !== null ? centerIdxFloat : (scrollTop + clientH / 2) / EST_MSG_HEIGHT))
       );
-      const newStart = Math.max(0, Math.min(total - VIRTUAL_WINDOW_SIZE, estimatedCenterIdx - Math.floor(VIRTUAL_WINDOW_SIZE / 2)));
+      let newStart = Math.max(0, Math.min(total - VIRTUAL_WINDOW_SIZE, estimatedCenterIdx - Math.floor(VIRTUAL_WINDOW_SIZE / 2)));
+      // The row under the reader's eye must exist in the new window, otherwise the restore below is
+      // skipped and the list re-centers on an estimate — that is the teleport on real phones.
+      if (anchorIdx !== null) {
+        if (anchorIdx < newStart) newStart = anchorIdx;
+        else if (anchorIdx >= newStart + VIRTUAL_WINDOW_SIZE) newStart = anchorIdx - VIRTUAL_WINDOW_SIZE + 1;
+        newStart = Math.max(0, Math.min(total - VIRTUAL_WINDOW_SIZE, newStart));
+      }
       const newEnd = Math.min(total, newStart + VIRTUAL_WINDOW_SIZE);
 
       if (newStart === start && newEnd === end) return;
@@ -4818,7 +4935,13 @@
         showToast('تمت العودة إلى وضع الموبايل 📱');
       });
 
-      window.addEventListener('resize', applyLayoutMode);
+      let layoutResizeTimer = null;
+      window.addEventListener('resize', () => {
+        // Browser chrome collapsing during a fling fires resize mid-gesture; re-laying out then
+        // changes the viewport height under the reader, so every resize is coalesced first.
+        clearTimeout(layoutResizeTimer);
+        layoutResizeTimer = setTimeout(applyLayoutMode, 200);
+      });
 
       // Mobile Perspective & Date Jump Listeners
       document.getElementById('mobilePerspectiveSelect').addEventListener('change', e => {
@@ -4900,6 +5023,17 @@
       // Scroll Top / Bottom Buttons & Live Scroll Position Persistence
       const viewport = document.getElementById('messagesViewport');
       let scrollSaveTimer = null;
+      // Reading inside a spacer means the window ends before the finger: rebuild now, not after the fling.
+      const virtualWindowInBlank = () => {
+        if (!state.virtualWindow.active) return false;
+        const total = state.currentFilteredMessages.length;
+        const { start, end } = state.virtualWindow;
+        const topBlank = start * EST_MSG_HEIGHT;
+        const bottomBlank = (total - end) * EST_MSG_HEIGHT;
+        const rowsEnd = viewport.scrollHeight - bottomBlank;
+        return (start > 0 && viewport.scrollTop + viewport.clientHeight * 0.4 < topBlank) ||
+               (end < total && viewport.scrollTop + viewport.clientHeight > rowsEnd - 40);
+      };
       viewport.addEventListener('scroll', () => {
         if (state.isRestoringScroll) {
           // Only a real drag takes over from the settle loop; a tap must not abandon it.
@@ -4910,7 +5044,12 @@
           return;
         }
         if (state.isInitializing) return;
-        handleVirtualViewportScroll();
+        if (virtualWindowInBlank()) {
+          clearTimeout(virtualShiftDebounceTimer);
+          handleVirtualViewportScroll(true);
+        } else {
+          scheduleVirtualShift();
+        }
         captureCurrentScrollPosition();
         clearTimeout(scrollSaveTimer);
         scrollSaveTimer = setTimeout(captureCurrentScrollPosition, 100);
@@ -4940,10 +5079,11 @@
         state.isUserGesture = false;
         clearTimeout(gestureEndTimer);
         clearTimeout(virtualFlushTimer);
+        // Wait for the momentum fling to settle (debounce keeps postponing) before rebuilding.
         gestureEndTimer = setTimeout(() => {
           if (state.pendingVirtualShift) {
             state.pendingVirtualShift = false;
-            handleVirtualViewportScroll();
+            scheduleVirtualShift();
           }
         }, 180);
       };
