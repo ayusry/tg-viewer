@@ -614,7 +614,7 @@
         <div class="flex items-center justify-between pt-1 border-t border-white/5">
           <span id="savedPositionIndicator" class="text-[10px] font-mono opacity-85 truncate max-w-[160px]">📍 الموضع: البداية</span>
           <div class="flex items-center gap-2">
-            <span id="appBuildVersion" class="text-[10px] font-mono opacity-60" dir="ltr">v4</span>
+            <span id="appBuildVersion" class="text-[10px] font-mono opacity-60" dir="ltr">v5</span>
             <button id="btnResetDemo" class="hover:underline text-[11px]" style="color: var(--tg-accent);">
               الشات التجريبي
             </button>
@@ -1319,6 +1319,7 @@
     const VIRTUAL_THRESHOLD = 220; // Virtualize any chat with > 220 messages
     const VIRTUAL_WINDOW_SIZE = 160; // Number of messages mounted in DOM at once
     let EST_MSG_HEIGHT = 84; // Estimated height in px, auto-calibrated from mounted rows
+    let pendingEstimateHeight = null; // applied at the next window render, never mid-flight
 
     const state = {
       chats: [],
@@ -3062,7 +3063,10 @@
       heights.sort((a, b) => a - b);
       const median = heights[Math.floor(heights.length / 2)];
       const next = Math.round(EST_MSG_HEIGHT * 0.65 + median * 0.35);
-      EST_MSG_HEIGHT = Math.max(44, Math.min(360, next));
+      // Staged, not applied: the spacers already in the DOM were built with the current value.
+      // Changing it here made the scroll math disagree with the real layout, and the drift hid
+      // whole spacer pages from the blank detector (the reader fell into them and froze there).
+      pendingEstimateHeight = Math.max(44, Math.min(360, next));
     }
 
     // Position of a row inside the scrollable content, in layout pixels (no CSS-transform scaling).
@@ -3082,6 +3086,27 @@
       viewport.scrollTop = clamped;
       state.expectedScrollTop = viewport.scrollTop;
       return viewport.scrollTop;
+    }
+
+    // Row height the mounted spacers were actually built with. The global estimate is recalibrated
+    // between renders, so using it here made the model drift away from the real layout.
+    function effectiveEstimateHeight() {
+      const est = state.virtualWindow && state.virtualWindow.est;
+      return typeof est === 'number' && est > 0 ? est : EST_MSG_HEIGHT;
+    }
+
+    // True when the viewport shows spacer only: the reader has scrolled past the mounted rows.
+    // Measured on real row rectangles — arithmetic based on an estimate can be fooled by drift.
+    function viewportIsInSpacer(viewport) {
+      if (!state.virtualWindow.active) return false;
+      const rows = viewport.querySelectorAll('div[id^="msg-"]');
+      if (!rows.length) return true;
+      const vpRect = viewport.getBoundingClientRect();
+      const firstRect = rows[0].getBoundingClientRect();
+      if (firstRect.top >= vpRect.bottom - 2) return true;
+      const lastRect = rows[rows.length - 1].getBoundingClientRect();
+      if (lastRect.bottom <= vpRect.top + 2) return true;
+      return false;
     }
 
     // Exact index of the message sitting at the vertical center of the viewport, read from the DOM.
@@ -3127,8 +3152,23 @@
       const query = state.searchQuery.trim();
       const msgById = state._activeChatMsgById || new Map();
 
+      if (pendingEstimateHeight != null) {
+        // A new estimate rewrites every spacer, so a deep window would jump by startIndex * delta
+        // (tens of thousands of px) unless the anchor restore is exact. Take it only while that
+        // displacement stays small; otherwise keep the current value and retry on a later render.
+        const startIdx = state.virtualWindow.active ? state.virtualWindow.start : 0;
+        const shift = Math.abs(pendingEstimateHeight - EST_MSG_HEIGHT) * startIdx;
+        if (shift <= 240) {
+          EST_MSG_HEIGHT = pendingEstimateHeight;
+          pendingEstimateHeight = null;
+        }
+      }
+
       const winStart = state.virtualWindow.active ? state.virtualWindow.start : 0;
       const winEnd = state.virtualWindow.active ? state.virtualWindow.end : total;
+      // Everything that measures this layout (spacers, blank detection, re-centering) must agree
+      // on one row height: the one these spacers are about to be built with.
+      state.virtualWindow.est = EST_MSG_HEIGHT;
 
       // Media that exists in the imported archive but was not extracted yet gets a one-tap loader.
       const lazyLoadButton = (path, msgId) => {
@@ -3462,15 +3502,17 @@
 
       const total = state.currentFilteredMessages.length;
       const { start, end } = state.virtualWindow;
+      const est = effectiveEstimateHeight();
       const scrollTop = viewport.scrollTop;
       const clientH = viewport.clientHeight;
-      const topSpacerH = start * EST_MSG_HEIGHT;
-      const bottomSpacerH = (total - end) * EST_MSG_HEIGHT;
+      const topSpacerH = start * est;
+      const bottomSpacerH = (total - end) * est;
 
+      const blankByDOM = viewportIsInSpacer(viewport);
       const nearTopEdge = start > 0 && scrollTop < topSpacerH + 900;
       const nearBottomEdge = end < total && (scrollTop + clientH) > (viewport.scrollHeight - bottomSpacerH - 900);
 
-      if (!nearTopEdge && !nearBottomEdge) return;
+      if (!blankByDOM && !nearTopEdge && !nearBottomEdge) return;
 
       // Find the top visible row and remember its exact distance from the top of the content.
       const vpRect = viewport.getBoundingClientRect();
@@ -3495,13 +3537,13 @@
       } else if (centerAbs <= topSpacerH) {
         centerIdxFloat = topSpacerH > 0 ? start * (centerAbs / topSpacerH) : 0;
       } else if (rowsHeight > 0) {
-        centerIdxFloat = end + (centerAbs - (topSpacerH + rowsHeight)) / Math.max(1, EST_MSG_HEIGHT);
+        centerIdxFloat = end + (centerAbs - (topSpacerH + rowsHeight)) / Math.max(1, est);
       } else {
         centerIdxFloat = (centerAbs / Math.max(1, viewport.scrollHeight)) * total;
       }
       const estimatedCenterIdx = Math.min(
         total - 1,
-        Math.max(0, Math.round(centerIdxFloat !== null ? centerIdxFloat : (scrollTop + clientH / 2) / EST_MSG_HEIGHT))
+        Math.max(0, Math.round(centerIdxFloat !== null ? centerIdxFloat : (scrollTop + clientH / 2) / est))
       );
       let newStart = Math.max(0, Math.min(total - VIRTUAL_WINDOW_SIZE, estimatedCenterIdx - Math.floor(VIRTUAL_WINDOW_SIZE / 2)));
       // The row under the reader's eye must exist in the new window, otherwise the restore below is
@@ -3534,6 +3576,19 @@
         if (targetRow) {
           const desired = contentOffsetTop(targetRow, viewport) - (viewport.clientHeight - targetRow.offsetHeight) / 2;
           applyViewportScrollTop(viewport, desired);
+        }
+      }
+      // A shift must never end with the reader parked in a spacer: clamp onto the nearest row.
+      if (viewportIsInSpacer(viewport)) {
+        const rows = viewport.querySelectorAll('div[id^="msg-"]');
+        if (rows.length) {
+          const vpRect = viewport.getBoundingClientRect();
+          const firstEl = rows[0];
+          const lastEl = rows[rows.length - 1];
+          const belowRows = lastEl.getBoundingClientRect().bottom <= vpRect.top + 2;
+          const edgeEl = belowRows ? lastEl : firstEl;
+          const edgeTop = contentOffsetTop(edgeEl, viewport);
+          applyViewportScrollTop(viewport, edgeTop - Math.max(12, (viewport.clientHeight - edgeEl.offsetHeight) / 2));
         }
       }
       state.isRestoringScroll = false;
@@ -5024,16 +5079,7 @@
       const viewport = document.getElementById('messagesViewport');
       let scrollSaveTimer = null;
       // Reading inside a spacer means the window ends before the finger: rebuild now, not after the fling.
-      const virtualWindowInBlank = () => {
-        if (!state.virtualWindow.active) return false;
-        const total = state.currentFilteredMessages.length;
-        const { start, end } = state.virtualWindow;
-        const topBlank = start * EST_MSG_HEIGHT;
-        const bottomBlank = (total - end) * EST_MSG_HEIGHT;
-        const rowsEnd = viewport.scrollHeight - bottomBlank;
-        return (start > 0 && viewport.scrollTop + viewport.clientHeight * 0.4 < topBlank) ||
-               (end < total && viewport.scrollTop + viewport.clientHeight > rowsEnd - 40);
-      };
+      const virtualWindowInBlank = () => viewportIsInSpacer(viewport);
       viewport.addEventListener('scroll', () => {
         if (state.isRestoringScroll) {
           // Only a real drag takes over from the settle loop; a tap must not abandon it.

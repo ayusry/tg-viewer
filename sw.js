@@ -1,4 +1,4 @@
-const CACHE_NAME = 'tg-viewer-v4';
+const CACHE_NAME = 'tg-viewer-v5';
 
 const APP_SHELL = [
   './',
